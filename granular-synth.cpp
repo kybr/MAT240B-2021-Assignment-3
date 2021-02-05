@@ -92,6 +92,37 @@ struct Peak {
   double magnitude, frequency;
 };
 
+struct Counter {
+  int i{0};
+  int operator()(int high, int low = 0) {
+    int value = i;
+
+    // side effect
+    i++;
+    if (i >= high) {
+      i = low;
+    }
+
+    return value;
+  }
+};
+
+struct Timer {
+  int i{0};
+
+  bool operator()(int limit) {
+    bool value = false;
+
+    i++;
+    if (i >= limit) {
+      i = 0;
+      value = true;
+    }
+
+    return value;
+  }
+};
+
 struct Grain {
   int begin;  // index into the vector<float> of the sound file
   int end;    // index into the vector<float> of the sound file
@@ -102,7 +133,43 @@ struct Grain {
   float centroid;
   float f0;
 
-  // add more features?
+  // play back a windowed version of this grain
+  //
+  Counter counter;
+  float operator()(std::vector<float> const &audio) {
+    int i = counter(end - begin);
+    return audio[i] * (1 - cos(2 * M_PI * i / (end - begin))) / 2;
+  }
+};
+
+struct GrainPlayer {
+  Timer advance;
+  int index{0};
+
+  float next(std::vector<Grain> const &grain, std::vector<float> const &audio) {
+    int length = grain.size();
+
+    if (advance(2048)) {
+      index++;
+      if (index >= length) {
+        index = 0;
+      }
+    }
+
+    int a = index - 1;
+    int b = index;
+    int c = index + 1;
+
+    // fix up
+    if (a < 0) {
+      a += length;
+    }
+    if (c >= length) {
+      c -= length;
+    }
+
+    return grain[a](audio) + grain[b](audio) + grain[c](audio);
+  }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -118,6 +185,7 @@ struct MyApp : App {
 
   std::vector<float> input;
   std::vector<Grain> grain;
+  GrainPlayer player;
 
   MyApp(int argc, char *argv[]) {
     if (argc < 2) {
@@ -139,18 +207,48 @@ struct MyApp : App {
     int fftSize = 8192;
 
     for (int n = 0; n < input.size() - clipSize; n += hopSize) {
-      // XXX build a grain; add it to the vector of grains
-      // - peak-to-peak amplitude
-      // - root-mean-squared
-      // - zero-crossing rate
-
       Grain grain;
+
+      grain.begin = n;
+      grain.end = n + clipSize;
 
       std::vector<double> clip(clipSize, 0.0);
       for (int i = 0; i < clip.size(); i++) {
         //          input      *       Hann window
         clip[i] = input[n + i] * (1 - cos(2 * M_PI * i / clip.size())) / 2;
       }
+
+      // peak-to-peak
+      //
+      double maximum = std::numeric_limits<double>::min();
+      double minimum = std::numeric_limits<double>::max();
+      for (int i = 0; i < clip.size(); i++) {
+        if (clip[i] > maximum) {
+          maximum = clip[i];
+        }
+        if (clip[i] < minimum) {
+          minimum = clip[i];
+        }
+      }
+      grain.peakToPeak = maximum - minimum;
+
+      // root mean squared
+      //
+      double sum = 0;
+      for (int i = 0; i < clip.size(); i++) {
+        sum += clip[i] * clip[i];
+      }
+      grain.rms = ::sqrt(sum / clip.size());
+
+      // zero crossing rate
+      //
+      int crossing = 0;
+      for (int i = 1; i < clip.size(); i++) {
+        if (clip[i - 1] * clip[i] < 0) {
+          crossing++;
+        }
+      }
+      grain.zcr = 1.0 * crossing / clip.size() * SAMPLE_RATE;
 
       CArray data;
       data.resize(fftSize);
@@ -165,8 +263,15 @@ struct MyApp : App {
       //
       fft(data);
 
-      // XXX here is where you might compute the spectral centroid
+      // spectral centroid
       //
+      double numerator = 0;
+      double denominator = 0;
+      for (int i = 0; i < data.size() / 2 + 1; i++) {
+        numerator += abs(data[i]) * SAMPLE_RATE * i / data.size();
+        denominator += abs(data[i]);
+      }
+      grain.centroid = numerator / denominator;
 
       std::vector<Peak> peak;
       for (int i = 1; i < data.size() / 2; i++) {
@@ -184,7 +289,42 @@ struct MyApp : App {
 
       peak.resize(10);  // throw away the extras
 
-      // XXX here's where you might estimate f0
+      // f0 estimation
+      //
+      std::map<double, int> histogram;
+      for (int i = 0; i < peak.size(); i++) {
+        for (int j = 1 + i; j < peak.size(); j++) {
+          double d = abs(peak[i].frequency - peak[j].frequency);
+          const double factor = 100;
+          d = round(factor * d) / factor;
+          if (histogram.count(d)) {
+            histogram[d]++;
+          } else {
+            histogram[d] = 1;
+          }
+        }
+      }
+
+      int max = 0;
+      grain.f0 = 0;
+      for (auto e : histogram) {
+        if (e.second > max) {
+          max = e.second;
+          grain.f0 = e.first;
+        }
+      }
+
+      /*
+      typedef std::pair<double, int> T;
+      std::vector<T> foo(histogram.begin(), histogram.end());
+      std::sort(foo.begin(), foo.end(),
+                [](T const &a, T const &b) { return a.second > b.second; });
+
+      for (auto e : foo) {
+        printf("%lf %d\n", e.first, e.second);
+      }
+      printf("\n");
+      */
 
       this->grain.emplace_back(grain);
     }
@@ -211,7 +351,7 @@ struct MyApp : App {
       float f = 0;
 
       // XXX
-      // f += ?
+      f += player.next(grain, audio);
       //
 
       f *= dbtoa(db.get());
@@ -223,8 +363,40 @@ struct MyApp : App {
   bool onKeyDown(const Keyboard &k) override {
     int midiNote = asciiToMIDI(k.key());
 
-    // respond to user action to re-order the grains
-    //
+    switch (k.key()) {
+      case '0':
+        sort(grain.begin(), grain.end(),
+             [](Grain const &a, Grain const &b) { return a.begin < b.begin; });
+        break;
+
+      case '1':
+        sort(grain.begin(), grain.end(), [](Grain const &a, Grain const &b) {
+          return a.peakToPeak < b.peakToPeak;
+        });
+        break;
+
+      case '2':
+        sort(grain.begin(), grain.end(),
+             [](Grain const &a, Grain const &b) { return a.rms < b.rms; });
+        break;
+
+      case '3':
+        sort(grain.begin(), grain.end(),
+             [](Grain const &a, Grain const &b) { return a.zcr < b.zcr; });
+        break;
+
+      case '4':
+        sort(grain.begin(), grain.end(), [](Grain const &a, Grain const &b) {
+          return a.centroid < b.centroid;
+        });
+        break;
+
+      case '5':
+        sort(grain.begin(), grain.end(),
+             [](Grain const &a, Grain const &b) { return a.f0 < b.f0; });
+        break;
+    }
+
     return true;
   }
 
